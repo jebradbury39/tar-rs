@@ -498,7 +498,6 @@ impl<'a> EntriesFields<'a> {
                 cur = off
                     .checked_add(len)
                     .ok_or_else(|| other("more bytes listed in sparse file than u64 can hold"))?;
-
                 remaining = remaining.checked_sub(len).ok_or_else(|| {
                     other(
                         "sparse file consumed more data than the header \
