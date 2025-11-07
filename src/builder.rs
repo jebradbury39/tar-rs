@@ -1024,10 +1024,8 @@ fn calc_pad_zeros(len: u64) -> u64 {
 
 fn pad_zeroes(dst: &mut dyn Write, len: u64) -> io::Result<()> {
     let buf = [0; BLOCK_SIZE as usize];
-    let remaining = calc_pad_zeros(len);
-    if remaining < BLOCK_SIZE {
-        dst.write_all(&buf[..remaining as usize])?;
-    }
+    let num_zeros = calc_pad_zeros(len);
+    dst.write_all(&buf[..num_zeros as usize])?;
     Ok(())
 }
 
@@ -1555,6 +1553,14 @@ fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
         }
 
         next_hole_start_offset = hole_offset;
+    }
+
+    if next_hole_start_offset > data_size {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "seek data went beyond the end of the file. \
+             Did the file change while appending?",
+        ));
     }
 
     if let Some(cur) = current_segment {
