@@ -27,6 +27,140 @@ struct BuilderOptions {
     sparse: bool,
 }
 
+/// Describes sparse-aware seek targets used by [`SeekSparse::seek_sparse`].
+///
+/// These variants mirror the Linux-style `SEEK_DATA` / `SEEK_HOLE` semantics
+/// so callers can iterate over alternating data and hole segments inside a
+/// sparse object. The offsets refer to the logical size of the data source.
+pub enum SeekFromSparse {
+    /// Adjust the seekable-object offset to the next location in the seekable-object
+    /// greater than or equal to offset containing data.  If offset
+    /// points to data, then the seekable-object offset is set to offset.
+    ///
+    /// If there is no more data to be found, this will result in an `UnexpectedEof`.
+    NextData(u64),
+    /// Adjust the seekable-object offset to the next hole in the seekable-object greater
+    /// than or equal to offset.  If offset points into the middle
+    /// of a hole, then the seekable-object offset is set to offset.  If there
+    /// is no hole past offset, then the seekable-object offset is adjusted to
+    /// the end of the seekable-object (i.e., there is an implicit hole at the
+    /// end of any seekable-object).
+    ///
+    /// If the offset is beyond the end of the seekable-object, this will result in an `UnexpectedEof`.
+    NextHole(u64),
+}
+
+/// A helper trait for data sources that can describe sparse regions.
+///
+/// Types implementing this trait allow [`Builder`] to skip reading empty
+/// segments when constructing sparse archive entries via
+/// [`Builder::append_sparse_data`].
+pub trait SeekSparse {
+    /// Seeks to the offset, and returns the new actual offset of the seekable-object
+    fn seek_sparse(&mut self, pos: SeekFromSparse) -> std::io::Result<u64>;
+
+    /// Returns the logical size (size of holes + data)
+    fn logical_size(&self) -> u64;
+
+    /// Returns the size of just the data
+    fn data_size(&self) -> u64;
+}
+
+struct FileWithMetadata<'a> {
+    file: &'a mut fs::File,
+    stat: &'a fs::Metadata,
+}
+
+impl<'a> Read for FileWithMetadata<'a> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl<'a> Seek for FileWithMetadata<'a> {
+    #[inline]
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+impl<'a> SeekSparse for FileWithMetadata<'a> {
+    fn seek_sparse(&mut self, pos: SeekFromSparse) -> std::io::Result<u64> {
+        use std::os::unix::io::AsRawFd as _;
+
+        fn lseek(file: &fs::File, offset: i64, whence: libc::c_int) -> Result<i64, i32> {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let lseek = libc::lseek64;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let lseek = libc::lseek;
+
+            match unsafe { lseek(file.as_raw_fd(), offset, whence) } {
+                -1 => Err(io::Error::last_os_error().raw_os_error().unwrap()),
+                off => Ok(off),
+            }
+        }
+
+        // On most Unixes, we need to read `_PC_MIN_HOLE_SIZE` to see if the file
+        // system supports `SEEK_HOLE`.
+        // FreeBSD: https://man.freebsd.org/cgi/man.cgi?query=lseek&sektion=2&manpath=FreeBSD+14.1-STABLE
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        if unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_MIN_HOLE_SIZE) } == -1 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SEEK_HOLE is not supported for this filesystem",
+            ));
+        }
+
+        let (off, whence) = match pos {
+            SeekFromSparse::NextData(offset) => {
+                let offset: i64 = offset.try_into().map_err(|_error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek data offset exceeds i64 max",
+                    )
+                })?;
+                (offset, libc::SEEK_DATA)
+            }
+            SeekFromSparse::NextHole(offset) => {
+                let offset: i64 = offset.try_into().map_err(|_error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek hole offset exceeds i64 max",
+                    )
+                })?;
+                (offset, libc::SEEK_HOLE)
+            }
+        };
+
+        match lseek(self.file, off, whence) {
+            Ok(off) => off.try_into().map_err(|_error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "seek sparse result offset is negative",
+                )
+            }),
+            Err(libc::ENXIO) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "hit ENXIO")),
+            Err(err) => Err(io::Error::from_raw_os_error(err)),
+        }
+    }
+
+    #[inline]
+    fn logical_size(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+
+        self.stat.size()
+    }
+
+    #[inline]
+    fn data_size(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+
+        self.stat.blocks()
+    }
+}
+
 impl<W: Write> Builder<W> {
     /// Create a new archive builder with the underlying object as the
     /// destination of all data written. The builder will use
@@ -182,6 +316,108 @@ impl<W: Write> Builder<W> {
         prepare_header_path(self.get_mut(), header, path.as_ref())?;
         header.set_cksum();
         self.append(header, data)
+    }
+
+    /// Adds a new sparse entry to this archive with the specified path.
+    ///
+    /// This function behaves like [`Self::append_data`], but it leverages the
+    /// [`SeekSparse`] implementation on the provided reader to avoid copying
+    /// data that resides in sparse regions. When the reader reports no sparse
+    /// blocks (or when sparse handling is disabled), this method falls back to
+    /// writing the entry as a regular file.
+    ///
+    /// As with other append methods, the header's size must match the logical
+    /// size of the entry, and the checksum will be recalculated after the path
+    /// metadata is prepared. Call [`Self::finish`] once all entries have been
+    /// written to complete the archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error encountered while preparing headers or copying
+    /// data from the sparse reader into the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{Cursor, Read, Seek, SeekFrom};
+    /// use tar::{Builder, Header, SeekFromSparse, SeekSparse};
+    ///
+    /// struct SparseCursor {
+    ///     cursor: Cursor<Vec<u8>>,
+    ///     hole_start: u64,
+    ///     hole_len: u64,
+    /// }
+    ///
+    /// impl Read for SparseCursor {
+    ///     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    ///         self.cursor.read(buf)
+    ///     }
+    /// }
+    ///
+    /// impl Seek for SparseCursor {
+    ///     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+    ///         self.cursor.seek(pos)
+    ///     }
+    /// }
+    ///
+    /// impl SeekSparse for SparseCursor {
+    ///     fn seek_sparse(&mut self, pos: SeekFromSparse) -> std::io::Result<u64> {
+    ///         match pos {
+    ///             SeekFromSparse::NextData(offset) => {
+    ///                 if offset < self.hole_start {
+    ///                     self.cursor.seek(SeekFrom::Start(offset))
+    ///                 } else {
+    ///                     Err(std::io::ErrorKind::UnexpectedEof.into())
+    ///                 }
+    ///             }
+    ///             SeekFromSparse::NextHole(offset) => {
+    ///                 if offset <= self.hole_start {
+    ///                     self.cursor.seek(SeekFrom::Start(self.hole_start))
+    ///                 } else {
+    ///                     Err(std::io::ErrorKind::UnexpectedEof.into())
+    ///                 }
+    ///             }
+    ///         }
+    ///     }
+    ///
+    ///     fn logical_size(&self) -> u64 {
+    ///         self.cursor.get_ref().len() as u64 + self.hole_len
+    ///     }
+    ///
+    ///     fn data_size(&self) -> u64 {
+    ///         self.cursor.get_ref().len() as u64
+    ///     }
+    /// }
+    ///
+    /// let mut header = Header::new_gnu();
+    /// header.set_mode(0o644);
+    ///
+    /// let data = SparseCursor {
+    ///     cursor: Cursor::new(b"hello world".to_vec()),
+    ///     hole_start: 11,
+    ///     hole_len: 13,
+    /// };
+    ///
+    /// let mut ar = Builder::new(Vec::new());
+    /// ar.append_sparse_data(&mut header, "file.txt", data).unwrap();
+    /// let _archive = ar.into_inner().unwrap();
+    /// ```
+    pub fn append_sparse_data<P: AsRef<Path>, R: Read + Seek + SeekSparse>(
+        &mut self,
+        header: &mut Header,
+        path: P,
+        mut data: R,
+    ) -> io::Result<()> {
+        if self.options.sparse {
+            prepare_header_path(self.get_mut(), header, path.as_ref())?;
+            header.set_size(data.logical_size());
+            let sparse_entries = prepare_header_sparse_generic(&mut data, header)?;
+            header.set_cksum();
+
+            append_sparse(self.get_mut(), header, sparse_entries, &mut data)
+        } else {
+            self.append_data(header, path, data)
+        }
     }
 
     /// Adds a new entry to this archive and returns an [`EntryWriter`] for
@@ -590,9 +826,41 @@ fn append(mut dst: &mut dyn Write, header: &Header, mut data: &mut dyn Read) -> 
     Ok(())
 }
 
+fn append_sparse<R: Read + Seek + SeekSparse>(
+    dst: &mut dyn Write,
+    header: &Header,
+    sparse_entries: Option<SparseEntries>,
+    data: &mut R,
+) -> io::Result<()> {
+    dst.write_all(header.as_bytes())?;
+
+    if let Some(sparse_entries) = sparse_entries {
+        append_extended_sparse_headers(dst, &sparse_entries)?;
+        for entry in sparse_entries.entries {
+            data.seek(io::SeekFrom::Start(entry.offset))?;
+            io::copy(&mut data.take(entry.num_bytes), dst)?;
+        }
+        pad_zeroes(dst, sparse_entries.on_disk_size)?;
+    } else {
+        let len = io::copy(data, dst)?;
+        pad_zeroes(dst, len)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn calc_pad_zeros(len: u64) -> u64 {
+    let r = len % BLOCK_SIZE;
+    if r == 0 {
+        0
+    } else {
+        BLOCK_SIZE - r
+    }
+}
+
 fn pad_zeroes(dst: &mut dyn Write, len: u64) -> io::Result<()> {
     let buf = [0; BLOCK_SIZE as usize];
-    let remaining = BLOCK_SIZE - (len % BLOCK_SIZE);
+    let remaining = calc_pad_zeros(len);
     if remaining < BLOCK_SIZE {
         dst.write_all(&buf[..remaining as usize])?;
     }
@@ -807,6 +1075,28 @@ fn prepare_header_sparse(
         _ => return Ok(None),
     };
 
+    println!("entries = {entries:#?}");
+
+    prepare_header_sparse_from_entries(header, &entries);
+
+    Ok(Some(entries))
+}
+
+fn prepare_header_sparse_generic<R: Read + Seek + SeekSparse>(
+    data: &mut R,
+    header: &mut Header,
+) -> io::Result<Option<SparseEntries>> {
+    let entries = match find_sparse_entries_seek(data)? {
+        Some(entries) => entries,
+        _ => return Ok(None),
+    };
+
+    prepare_header_sparse_from_entries(header, &entries);
+
+    Ok(Some(entries))
+}
+
+fn prepare_header_sparse_from_entries(header: &mut Header, entries: &SparseEntries) {
     header.set_entry_type(EntryType::GNUSparse);
     header.set_size(entries.on_disk_size);
 
@@ -822,8 +1112,6 @@ fn prepare_header_sparse(
         header_entry.set_length(entry.num_bytes);
     }
     gnu_header.set_is_extended(entries.entries.len() > gnu_header.sparse.len());
-
-    Ok(Some(entries))
 }
 
 /// Write extra sparse headers into `dst` for those entries that did not fit in the main header.
@@ -924,7 +1212,9 @@ impl SparseEntries {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct SparseEntry {
+    /// offset on seekable data
     offset: u64,
+    /// length on seekable data
     num_bytes: u64,
 }
 
@@ -946,39 +1236,23 @@ fn find_sparse_entries(
     }
 
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
-    find_sparse_entries_seek(file, stat)
+    find_sparse_entries_seek(&mut FileWithMetadata { file, stat })
 }
 
-/// Implementation of `find_sparse_entries` using `SEEK_HOLE` and `SEEK_DATA`.
-#[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
-fn find_sparse_entries_seek(
-    file: &mut fs::File,
-    stat: &fs::Metadata,
+fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
+    data: &mut R,
 ) -> io::Result<Option<SparseEntries>> {
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::io::AsRawFd as _;
+    let data_size = data.logical_size();
 
-    fn lseek(file: &fs::File, offset: i64, whence: libc::c_int) -> Result<i64, i32> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let lseek = libc::lseek64;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let lseek = libc::lseek;
-
-        match unsafe { lseek(file.as_raw_fd(), offset, whence) } {
-            -1 => Err(io::Error::last_os_error().raw_os_error().unwrap()),
-            off => Ok(off),
-        }
-    }
-
-    if stat.blocks() == 0 {
-        return Ok(if stat.size() == 0 {
+    if data.data_size() == 0 {
+        return Ok(if data.logical_size() == 0 {
             // Empty file.
             None
         } else {
             // Fully sparse file.
             Some(SparseEntries {
                 entries: vec![SparseEntry {
-                    offset: stat.size(),
+                    offset: data.logical_size(),
                     num_bytes: 0,
                 }],
                 on_disk_size: 0,
@@ -986,122 +1260,153 @@ fn find_sparse_entries_seek(
         });
     }
 
-    // On most Unixes, we need to read `_PC_MIN_HOLE_SIZE` to see if the file
-    // system supports `SEEK_HOLE`.
-    // FreeBSD: https://man.freebsd.org/cgi/man.cgi?query=lseek&sektion=2&manpath=FreeBSD+14.1-STABLE
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    if unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_MIN_HOLE_SIZE) } == -1 {
-        return Ok(None);
-    }
-
-    // Linux is the only UNIX-like without support for `_PC_MIN_HOLE_SIZE`, so
-    // instead we try to call `lseek` and see if it fails.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    match lseek(file, 0, libc::SEEK_HOLE) {
+    // preliminary check (we have data since non-zero size, so the next hole should be findable)
+    match data.seek_sparse(SeekFromSparse::NextHole(0)) {
         Ok(_) => (),
-        Err(libc::ENXIO) => {
-            // The file is empty. Treat it as non-sparse.
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            // The data is empty (or the data is not sparse-compatible). Either way, treat it as non-sparse.
             return Ok(None);
         }
-        Err(_) => return Ok(None),
+        Err(err) => {
+            return Err(err);
+        }
     }
 
-    let mut entries = Vec::new();
-    let mut on_disk_size = 0;
-    let mut off_s = 0;
+    // if a hole is smaller than BLOCK_SIZE, then we need to treat that just as zeros. We must also ensure that all
+    // SparseEntry items are aligned to BLOCK_SIZE.
+
+    let mut entries: Vec<SparseEntry> = Vec::new();
+    let mut on_disk_size: u64 = 0;
+    let mut next_hole_start_offset: u64 = 0;
+    let mut current_segment: Option<SparseEntry> = None;
     loop {
+        //  off_s = next_hole_start_offset
+        //
         //  off_s=0      │     off_s               │ off_s
         //    ↓          │       ↓                 │   ↓
         //    | DATA |…  │  ……………| HOLE | DATA |…  │  …|×EOF×
         //    ↑          │       ↑      ↑          │
         //   (a)         │  (b) (c)    (d)         │     (e)
-        match lseek(file, off_s, libc::SEEK_DATA) {
-            Ok(0) if off_s == 0 => (), // (a) The file starts with data.
-            Ok(off) if off < off_s => {
-                // (b) Unlikely.
-                return Err(std::io::Error::new(
-                    io::ErrorKind::Other,
-                    "lseek(SEEK_DATA) went backwards",
-                ));
-            }
-            Ok(off) if off == off_s => {
-                // (c) The data at the same offset as the hole.
-                return Err(std::io::Error::new(
-                    io::ErrorKind::Other,
-                    "lseek(SEEK_DATA) did not advance. \
+        let data_start_offset =
+            match data.seek_sparse(SeekFromSparse::NextData(next_hole_start_offset)) {
+                Ok(offset) if offset == 0 => offset, // (a) The file starts with data (pointing at the start of the data).
+                Ok(offset) if offset < next_hole_start_offset => {
+                    // (b) Unlikely.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "seek data went backwards",
+                    ));
+                }
+                Ok(offset) if offset == next_hole_start_offset => {
+                    // (c) The data at the same offset as the hole.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "seek data did not advance. \
                      Did the file change while appending?",
-                ));
-            }
-            Ok(off) => off_s = off,    // (d) Jump to the next hole.
-            Err(libc::ENXIO) => break, // (e) Reached the end of the file.
-            Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
-        };
+                    ));
+                }
+                Ok(offset) => offset, // (d) This is now pointing at the start of the next data.
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break, // (e) Reached the end of the file.
+                Err(error) => return Err(error),
+            };
 
+        // check if we can save our current segment (can we pad our previous data with our most recent hole?)
+        /*if let Some(cur) = &mut current_segment {
+            let prev_hole_length = data_start_offset - next_hole_start_offset;
+            if calc_pad_zeros(cur.num_bytes) <= prev_hole_length {
+                cur.num_bytes += calc_pad_zeros(cur.num_bytes);
+
+                on_disk_size += cur.num_bytes;
+                entries.push(*cur);
+
+                current_segment = None;
+            } else {
+                // the hole is too small to actually be represented as sparse (just use zeros)
+                cur.num_bytes += prev_hole_length;
+            }
+        }*/
+
+        // off_s = data_offset
+        //
         // off_s=0          │     off_s               │    off_s
         //   ↓              │       ↓                 │      ↓
         //   | DATA |×EOF×  │  ……………| DATA | HOLE |…  │  …|×EOF×
         //          ↑       │       ↑      ↑          │
         //         (a)      │  (b) (c)    (d)         │     (e)
-        match lseek(file, off_s, libc::SEEK_HOLE) {
-            Ok(off_e) if off_s == 0 && (off_e as u64) == stat.size() => {
+        let hole_offset = match data.seek_sparse(SeekFromSparse::NextHole(data_start_offset))
+        {
+            Ok(offset) if data_start_offset == 0 && offset == data_size => {
                 // (a) The file is not sparse.
-                file.seek(io::SeekFrom::Start(0))?;
+                data.seek(io::SeekFrom::Start(0))?;
                 return Ok(None);
             }
-            Ok(off_e) if off_e < off_s => {
+            Ok(offset) if offset < next_hole_start_offset => {
                 // (b) Unlikely.
-                return Err(std::io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "lseek(SEEK_HOLE) went backwards",
+                    "seek hole went backwards",
                 ));
             }
-            Ok(off_e) if off_e == off_s => {
+            Ok(offset) if offset == data_start_offset => {
                 // (c) The hole at the same offset as the data.
-                return Err(std::io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "lseek(SEEK_HOLE) did not advance. \
-                     Did the file change while appending?",
+                    "seek hole did not advance. \
+                     Did the data change while appending?",
                 ));
             }
-            Ok(off_e) => {
+            Ok(offset) => {
                 // (d) Found a hole or reached the end of the file (implicit
                 // zero-length hole).
-                entries.push(SparseEntry {
-                    offset: off_s as u64,
-                    num_bytes: off_e as u64 - off_s as u64,
-                });
-                on_disk_size += off_e as u64 - off_s as u64;
-                off_s = off_e;
+                offset
             }
-            Err(libc::ENXIO) => {
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 // (e) off_s was already beyond the end of the file.
-                return Err(std::io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "lseek(SEEK_HOLE) returned ENXIO. \
-                     Did the file change while appending?",
+                    "seek hole returned UnexpectedEof. \
+                     Did the data change while appending?",
                 ));
             }
-            Err(errno) => return Err(io::Error::from_raw_os_error(errno)),
+            Err(error) => return Err(error),
         };
+
+        let data_len = hole_offset - data_start_offset;
+
+        let cur = if let Some(mut cur) = current_segment {
+            cur.num_bytes += data_len;
+            cur
+        } else {
+            SparseEntry { offset: data_start_offset, num_bytes: data_len }
+        };
+
+        // check if we are naturally block-aligned (likely file-based data)
+        if cur.num_bytes % BLOCK_SIZE == 0 {
+            on_disk_size += cur.num_bytes;
+            entries.push(cur);
+
+            current_segment = None;
+        } else {
+            current_segment = Some(cur);
+        }
+
+        next_hole_start_offset = hole_offset;
     }
 
-    if off_s as u64 > stat.size() {
-        return Err(std::io::Error::new(
-            io::ErrorKind::Other,
-            "lseek(SEEK_DATA) went beyond the end of the file. \
-             Did the file change while appending?",
-        ));
+    if let Some(cur) = current_segment {
+        on_disk_size += cur.num_bytes;
+        entries.push(cur);
     }
 
     // Add a final zero-length entry. It is required if the file ends with a
     // hole, and redundant otherwise. However, we add it unconditionally to
     // mimic GNU tar behavior.
     entries.push(SparseEntry {
-        offset: stat.size(),
+        offset: data_size,
         num_bytes: 0,
     });
 
-    file.seek(io::SeekFrom::Start(0))?;
+    data.seek(io::SeekFrom::Start(0))?;
 
     Ok(Some(SparseEntries {
         entries,
