@@ -1651,7 +1651,7 @@ fn writing_sparse_data() {
         let mut header = Header::new_gnu();
         header.set_mode(0o644);
 
-        ar.append_sparse_data(&mut header, name, data).expect(name);
+        ar.append_sparse_data(header, name, data).expect(name);
         expected.push((*name, expected_bytes));
     }
 
