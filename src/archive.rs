@@ -482,11 +482,10 @@ impl<'a> EntriesFields<'a> {
                 let off = block.offset()?;
                 let len = block.length()?;
                 if len != 0 && (size - remaining) % BLOCK_SIZE != 0 {
-                    panic!("len={len}, size={size}, rem={remaining}");
-                    /*return Err(other(
+                    return Err(other(
                         "previous block in sparse file was not \
                          aligned to 512-byte boundary",
-                    ));*/
+                    ));
                 } else if off < cur {
                     return Err(other(
                         "out of order or overlapping sparse \
@@ -499,10 +498,6 @@ impl<'a> EntriesFields<'a> {
                 cur = off
                     .checked_add(len)
                     .ok_or_else(|| other("more bytes listed in sparse file than u64 can hold"))?;
-
-                if len > remaining {
-                    panic!("size={}, len={len}, remaining={remaining}", entry.size);
-                }
 
                 remaining = remaining.checked_sub(len).ok_or_else(|| {
                     other(

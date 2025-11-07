@@ -1075,8 +1075,6 @@ fn prepare_header_sparse(
         _ => return Ok(None),
     };
 
-    println!("entries = {entries:#?}");
-
     prepare_header_sparse_from_entries(header, &entries);
 
     Ok(Some(entries))
@@ -1311,7 +1309,7 @@ fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
             };
 
         // check if we can save our current segment (can we pad our previous data with our most recent hole?)
-        /*if let Some(cur) = &mut current_segment {
+        if let Some(cur) = &mut current_segment {
             let prev_hole_length = data_start_offset - next_hole_start_offset;
             if calc_pad_zeros(cur.num_bytes) <= prev_hole_length {
                 cur.num_bytes += calc_pad_zeros(cur.num_bytes);
@@ -1324,7 +1322,7 @@ fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
                 // the hole is too small to actually be represented as sparse (just use zeros)
                 cur.num_bytes += prev_hole_length;
             }
-        }*/
+        }
 
         // off_s = data_offset
         //
@@ -1333,8 +1331,7 @@ fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
         //   | DATA |×EOF×  │  ……………| DATA | HOLE |…  │  …|×EOF×
         //          ↑       │       ↑      ↑          │
         //         (a)      │  (b) (c)    (d)         │     (e)
-        let hole_offset = match data.seek_sparse(SeekFromSparse::NextHole(data_start_offset))
-        {
+        let hole_offset = match data.seek_sparse(SeekFromSparse::NextHole(data_start_offset)) {
             Ok(offset) if data_start_offset == 0 && offset == data_size => {
                 // (a) The file is not sparse.
                 data.seek(io::SeekFrom::Start(0))?;
@@ -1377,7 +1374,10 @@ fn find_sparse_entries_seek<R: Read + Seek + SeekSparse>(
             cur.num_bytes += data_len;
             cur
         } else {
-            SparseEntry { offset: data_start_offset, num_bytes: data_len }
+            SparseEntry {
+                offset: data_start_offset,
+                num_bytes: data_len,
+            }
         };
 
         // check if we are naturally block-aligned (likely file-based data)
