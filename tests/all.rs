@@ -1605,23 +1605,6 @@ impl<'a> SeekSparse for SparseSegments<'a> {
 fn writing_sparse_data() {
     let mut ar = Builder::new(Vec::new());
 
-    fn expected_bytes(segments: &[SparseSegment]) -> Vec<u8> {
-        let logical_size = segments
-            .iter()
-            .map(|segment| segment.end())
-            .max()
-            .unwrap_or(0);
-
-        let mut bytes = vec![0u8; logical_size as usize];
-        for segment in segments {
-            let start = segment.offset as usize;
-            let end = segment.end() as usize;
-            bytes[start..end].copy_from_slice(&segment.data);
-        }
-
-        bytes
-    }
-
     let cases: Vec<(&str, Vec<SparseSegment>)> = vec![
         ("empty", vec![]),
         ("full_sparse", vec![SparseSegment::new(0x20_000, 0, b'a')]),
@@ -1660,14 +1643,16 @@ fn writing_sparse_data() {
     let mut expected = Vec::new();
 
     for (name, segments) in &cases {
-        let expected_bytes = expected_bytes(segments);
-        let data = SparseSegments::new(segments);
+        let mut data = SparseSegments::new(segments);
+        let mut expected_bytes = Vec::new();
+        data.read_to_end(&mut expected_bytes).unwrap();
+        data.seek(io::SeekFrom::Start(0)).unwrap();
 
         let mut header = Header::new_gnu();
         header.set_mode(0o644);
 
         ar.append_sparse_data(&mut header, name, data).expect(name);
-        expected.push(((*name).to_string(), expected_bytes));
+        expected.push((*name, expected_bytes));
     }
 
     ar.finish().unwrap();
@@ -1683,7 +1668,7 @@ fn writing_sparse_data() {
     let mut entries = ar.entries().unwrap();
 
     for (expected_name, expected_contents) in expected {
-        let mut entry = entries.next().unwrap().expect(&expected_name);
+        let mut entry = entries.next().unwrap().expect(expected_name);
         assert_eq!(
             &*entry.header().path_bytes(),
             expected_name.as_bytes(),
