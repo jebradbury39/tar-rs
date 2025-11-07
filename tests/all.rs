@@ -1379,10 +1379,6 @@ fn writing_sparse() {
 
         let expected = fs::read_to_string(&path).unwrap();
 
-        if s != expected {
-            println!("{s}\nVS\n{expected}");
-        }
-
         assert!(
             s == expected,
             "path: {path:?}, actual len = {}, expected len = {}",
