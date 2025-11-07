@@ -326,9 +326,12 @@ impl<W: Write> Builder<W> {
     /// blocks (or when sparse handling is disabled), this method falls back to
     /// writing the entry as a regular file.
     ///
-    /// As with other append methods, the header's size must match the logical
-    /// size of the entry, and the checksum will be recalculated after the path
-    /// metadata is prepared. Call [`Self::finish`] once all entries have been
+    /// The header's size will be set to the logical size of the entry
+    /// (as provided by [`SeekSparse::logical_size`]),
+    /// and the checksum will be recalculated after the path
+    /// metadata is prepared. Other header attributes (like mode) should be set
+    /// prior to passing the header into this function.
+    /// Call [`Self::finish`] once all entries have been
     /// written to complete the archive.
     ///
     /// # Errors
@@ -560,24 +563,24 @@ impl<W: Write> Builder<W> {
     /// let data = SparseSegments::new(&segments);
     ///
     /// let mut ar = Builder::new(Vec::new());
-    /// ar.append_sparse_data(&mut header, "file.txt", data).unwrap();
+    /// ar.append_sparse_data(header, "file.txt", data).unwrap();
     /// let _archive = ar.into_inner().unwrap();
     /// ```
     pub fn append_sparse_data<P: AsRef<Path>, R: Read + Seek + SeekSparse>(
         &mut self,
-        header: &mut Header,
+        mut header: Header,
         path: P,
         mut data: R,
     ) -> io::Result<()> {
         if self.options.sparse {
-            prepare_header_path(self.get_mut(), header, path.as_ref())?;
+            prepare_header_path(self.get_mut(), &mut header, path.as_ref())?;
             header.set_size(data.logical_size());
-            let sparse_entries = prepare_header_sparse_generic(&mut data, header)?;
+            let sparse_entries = prepare_header_sparse_generic(&mut data, &mut header)?;
             header.set_cksum();
 
-            append_sparse(self.get_mut(), header, sparse_entries, &mut data)
+            append_sparse(self.get_mut(), &header, sparse_entries, &mut data)
         } else {
-            self.append_data(header, path, data)
+            self.append_data(&mut header, path, data)
         }
     }
 
