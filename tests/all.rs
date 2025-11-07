@@ -1380,10 +1380,15 @@ fn writing_sparse() {
         let expected = fs::read_to_string(&path).unwrap();
 
         if s != expected {
-        println!("{s}\nVS\n{expected}");
+            println!("{s}\nVS\n{expected}");
         }
 
-        assert!(s == expected, "path: {path:?}, actual len = {}, expected len = {}", s.len(), expected.len());
+        assert!(
+            s == expected,
+            "path: {path:?}, actual len = {}, expected len = {}",
+            s.len(),
+            expected.len()
+        );
     }
 
     assert!(entries.next().is_none());
@@ -1404,6 +1409,15 @@ struct SparseSegment {
 }
 
 impl SparseSegment {
+    #[allow(clippy::option_map_unit_fn)]
+    fn new(offset: u64, len: usize, fill_byte: u8) -> Self {
+        let mut data = vec![fill_byte; len];
+        data.first_mut().map(|x| *x = b'[');
+        data.last_mut().map(|x| *x = b']');
+
+        Self { offset, data }
+    }
+
     fn end(&self) -> u64 {
         self.offset + self.data.len() as u64
     }
@@ -1476,19 +1490,50 @@ impl<'a> Read for SparseSegments<'a> {
 
 impl<'a> Seek for SparseSegments<'a> {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        let logical = self.logical_size as i128;
-
         let target = match pos {
-            io::SeekFrom::Start(offset) => offset as i128,
-            io::SeekFrom::Current(offset) => self.pos as i128 + offset as i128,
-            io::SeekFrom::End(offset) => logical + offset as i128,
+            io::SeekFrom::Start(offset) => offset,
+            io::SeekFrom::Current(offset) => {
+                if offset >= 0 {
+                    self.pos.checked_add(offset as u64).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid seek past u64 max")
+                    })?
+                } else {
+                    let abs = (-offset) as u64;
+                    self.pos.checked_sub(abs).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid seek before start of sparse segments",
+                        )
+                    })?
+                }
+            }
+            io::SeekFrom::End(offset) => {
+                if offset >= 0 {
+                    self.logical_size
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid seek past end of sparse segments",
+                            )
+                        })?
+                } else {
+                    let abs = (-offset) as u64;
+                    self.logical_size.checked_sub(abs).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid seek before start of sparse segments",
+                        )
+                    })?
+                }
+            }
         };
 
-        if target < 0 || target > logical {
+        if target > self.logical_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"));
         }
 
-        self.pos = target as u64;
+        self.pos = target;
         Ok(self.pos)
     }
 }
@@ -1579,58 +1624,37 @@ fn writing_sparse_data() {
 
     let cases: Vec<(&str, Vec<SparseSegment>)> = vec![
         ("empty", vec![]),
-        ("full_sparse", vec![SparseSegment {
-            offset: 0x20_000,
-            data: Vec::new(),
-        }]),
-        ("_x", vec![SparseSegment {
-            offset: 0x20_000,
-            data: vec![b'a'; 0x1_000],
-        }]),
-        ("x_", vec![
-            SparseSegment {
-                offset: 0,
-                data: vec![b'b'; 0x1_000],
-            },
-            SparseSegment {
-                offset: 0x20_000,
-                data: Vec::new(),
-            },
-        ]),
-        ("_x_x", vec![
-            SparseSegment {
-                offset: 0x20_000,
-                data: vec![b'c'; 0x1_000],
-            },
-            SparseSegment {
-                offset: 0x40_000,
-                data: vec![b'd'; 0x1_000],
-            },
-        ]),
-        ("x_x_", vec![
-            SparseSegment {
-                offset: 0,
-                data: vec![b'e'; 0x1_000],
-            },
-            SparseSegment {
-                offset: 0x20_000,
-                data: vec![b'f'; 0x1_000],
-            },
-            SparseSegment {
-                offset: 0x40_000,
-                data: Vec::new(),
-            },
-        ]),
-        ("uneven", vec![
-            SparseSegment {
-                offset: 0x20_333,
-                data: vec![b'u'; 0x555],
-            },
-            SparseSegment {
-                offset: 0x40_777,
-                data: vec![b'v'; 0x999],
-            },
-        ]),
+        ("full_sparse", vec![SparseSegment::new(0x20_000, 0, b'a')]),
+        ("_x", vec![SparseSegment::new(0x20_000, 0x1_000, b'a')]),
+        (
+            "x_",
+            vec![
+                SparseSegment::new(0, 0x1_000, b'b'),
+                SparseSegment::new(0x20_000, 0, b'b'),
+            ],
+        ),
+        (
+            "_x_x",
+            vec![
+                SparseSegment::new(0x20_000, 0x1_000, b'c'),
+                SparseSegment::new(0x40_000, 0x1_000, b'd'),
+            ],
+        ),
+        (
+            "x_x_",
+            vec![
+                SparseSegment::new(0, 0x1_000, b'e'),
+                SparseSegment::new(0x20_000, 0x1_000, b'f'),
+                SparseSegment::new(0x40_000, 0, b'f'),
+            ],
+        ),
+        (
+            "uneven",
+            vec![
+                SparseSegment::new(0x20_333, 0x555, b'u'),
+                SparseSegment::new(0x40_777, 0x999, b'v'),
+            ],
+        ),
     ];
 
     let mut expected = Vec::new();
@@ -1668,7 +1692,12 @@ fn writing_sparse_data() {
 
         let mut contents = Vec::new();
         entry.read_to_end(&mut contents).unwrap();
-        assert!(contents == expected_contents, "path: {expected_name}, actual len = {}, expected len = {}", contents.len(), expected_contents.len());
+        assert!(
+            contents == expected_contents,
+            "path: {expected_name}, actual len = {}, expected len = {}",
+            contents.len(),
+            expected_contents.len()
+        );
     }
 
     assert!(entries.next().is_none());
