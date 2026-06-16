@@ -614,7 +614,8 @@ impl<W: Write> Builder<W> {
         mut data: R,
     ) -> io::Result<()> {
         if self.options.sparse {
-            prepare_header_path(self.get_mut(), &mut header, path.as_ref())?;
+            let allow_absolute = self.options.preserve_absolute;
+            prepare_header_path(self.get_mut(), &mut header, path.as_ref(), allow_absolute)?;
             header.set_size(data.logical_size());
             let sparse_entries = prepare_header_sparse_generic(&mut data, &mut header)?;
             header.set_cksum();
